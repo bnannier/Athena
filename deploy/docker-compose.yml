@@ -1,0 +1,232 @@
+services:
+  nginx-proxy:
+    image: nginxproxy/nginx-proxy:latest
+    container_name: nginx-proxy
+    ports:
+      - '80:80'
+      - '443:443'
+    volumes:
+      - /var/run/docker.sock:/tmp/docker.sock:ro
+      - certs:/etc/nginx/certs
+      - vhost:/etc/nginx/vhost.d
+      - html:/usr/share/nginx/html
+    networks:
+      - web
+      - intranet
+
+  letencrypt-autogen:
+    image: nginxproxy/acme-companion:2.2
+    container_name: letencrypt-autogen
+    environment:
+      DEFAULT_EMAIL: info@cloud-ctl.com
+    volumes_from:
+      - nginx-proxy
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - acme:/etc/acme.sh
+    networks:
+      - web
+      - intranet
+    restart: unless-stopped
+    depends_on:
+      - nginx-proxy
+
+  # Kratos Migration Service
+  kratos-migrate:
+    image: oryd/kratos:v1.3.1
+    environment:
+      - DSN=sqlite:///var/lib/sqlite/db.sqlite?_fk=true&mode=rwc
+    volumes:
+      - type: volume
+        source: kratos-sqlite
+        target: /var/lib/sqlite
+        read_only: false
+      - type: bind
+        source: ./config/kratos
+        target: /etc/config/kratos
+    command: -c /etc/config/kratos/kratos.yml migrate sql -e --yes
+    restart: on-failure
+    networks:
+      - intranet
+
+  # Kratos Main Service
+  kratos:
+    depends_on:
+      - kratos-migrate
+    image: oryd/kratos:v1.3.1
+    environment:
+      DSN: sqlite:///var/lib/sqlite/db.sqlite?_fk=true
+      VIRTUAL_HOST: kratos.ory.cloud-ctl.com
+      VIRTUAL_PORT: 4433
+      LETSENCRYPT_HOST: kratos.ory.cloud-ctl.com
+      LETSENCRYPT_EMAIL: info@cloud-ctl.com
+    command: serve -c /etc/config/kratos/kratos.yml
+    volumes:
+      - type: volume
+        source: kratos-sqlite
+        target: /var/lib/sqlite
+        read_only: false
+      - type: bind
+        source: ./config/kratos
+        target: /etc/config/kratos
+    networks:
+      - web
+      - intranet
+    restart: unless-stopped
+
+  # Kratos Admin UI (Production Image)
+  kratos-admin-ui:
+    image: dhiagharsallaoui/kratos-admin-ui:latest
+    environment:
+      VIRTUAL_HOST: admin.ory.cloud-ctl.com
+      VIRTUAL_PORT: 3000
+      LETSENCRYPT_HOST: admin.ory.cloud-ctl.com
+      LETSENCRYPT_EMAIL: info@cloud-ctl.com
+      KRATOS_ADMIN_URL: http://kratos:4434
+      KRATOS_PUBLIC_URL: http://kratos:4433
+      NEXT_PUBLIC_KRATOS_PUBLIC_URL: https://kratos.${DOMAIN}
+      NEXT_PUBLIC_KRATOS_ADMIN_URL: http://kratos:4434
+      HYDRA_ADMIN_URL: http://hydra:4445
+      HYDRA_PUBLIC_URL: http://hydra:4444
+      NEXT_PUBLIC_HYDRA_PUBLIC_URL: https://hydra.${DOMAIN}
+      NEXT_PUBLIC_HYDRA_ADMIN_URL: http://hydra:4445
+      NEXT_PUBLIC_APP_NAME: '${APP_NAME:-Kratos Admin UI}'
+      NEXT_PUBLIC_APP_URL: https://admin.${DOMAIN}
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY}
+      NODE_ENV: production
+    networks:
+      - web
+      - intranet
+    restart: unless-stopped
+    depends_on:
+      - kratos
+      - hydra
+
+  # SMTP Server for Email Delivery
+  smtp:
+    image: mailhog/mailhog:latest
+    networks:
+      - web
+      - intranet
+    restart: unless-stopped
+    environment:
+      VIRTUAL_HOST: mail.ory.cloud-ctl.com
+      VIRTUAL_PORT: 8025
+      LETSENCRYPT_HOST: mail.ory.cloud-ctl.com
+      LETSENCRYPT_EMAIL: info@cloud-ctl.com
+
+  # Hydra SQLite Volume Permissions
+  hydra-sqlite-init:
+    image: busybox
+    volumes:
+      - hydra-sqlite:/mnt/sqlite
+    command: 'chmod -R 777 /mnt/sqlite'
+
+  # Hydra Migration Service
+  hydra-migrate:
+    image: oryd/hydra:v2.3.0
+    environment:
+      - DSN=sqlite:///mnt/sqlite/db.sqlite?_fk=true&mode=rwc
+    command: migrate -c /etc/config/hydra/hydra.yml sql up -e --yes
+    volumes:
+      - type: volume
+        source: hydra-sqlite
+        target: /mnt/sqlite
+        read_only: false
+      - type: bind
+        source: ./config/hydra
+        target: /etc/config/hydra
+    restart: on-failure
+    networks:
+      - intranet
+    depends_on:
+      - hydra-sqlite-init
+
+  # Hydra Main Service
+  hydra:
+    image: oryd/hydra:v2.3.0
+    environment:
+      - DSN=sqlite:///mnt/sqlite/db.sqlite?_fk=true&mode=rwc
+      - VIRTUAL_HOST=hydra.ory.cloud-ctl.com
+      - VIRTUAL_PORT=4444
+      - LETSENCRYPT_HOST=hydra.ory.cloud-ctl.com
+      - LETSENCRYPT_EMAIL=info@cloud-ctl.com
+    command: serve -c /etc/config/hydra/hydra.yml all
+    volumes:
+      - type: volume
+        source: hydra-sqlite
+        target: /mnt/sqlite
+        read_only: false
+      - type: bind
+        source: ./config/hydra
+        target: /etc/config/hydra
+    restart: unless-stopped
+    depends_on:
+      - hydra-migrate
+      - hydra-sqlite-init
+    networks:
+      - web
+      - intranet
+
+  # Hydra Consent/Login UI
+  hydra-consent:
+    environment:
+      - HYDRA_ADMIN_URL=http://hydra:4445
+      - VIRTUAL_HOST=consent.ory.cloud-ctl.com
+      - VIRTUAL_PORT=3000
+      - LETSENCRYPT_HOST=consent.ory.cloud-ctl.com
+      - LETSENCRYPT_EMAIL=info@cloud-ctl.com
+    image: oryd/hydra-login-consent-node:v2.3.0
+    restart: unless-stopped
+    networks:
+      - web
+      - intranet
+
+  # Initialize test identities
+  init-identities:
+    image: curlimages/curl:latest
+    depends_on:
+      - kratos
+    volumes:
+      - type: bind
+        source: ./init-identities.sh
+        target: /init-identities.sh
+    environment:
+      - DOMAIN=${DOMAIN}
+    networks:
+      - intranet
+    command: sh /init-identities.sh
+    restart: 'no'
+    profiles:
+      - init
+
+  # Initialize OAuth 2.0 clients
+  init-clients:
+    image: curlimages/curl:latest
+    depends_on:
+      - hydra
+    volumes:
+      - type: bind
+        source: ./init-clients.sh
+        target: /init-clients.sh
+    networks:
+      - intranet
+    command: sh /init-clients.sh
+    restart: 'no'
+    profiles:
+      - init
+
+networks:
+  web:
+    external: true
+  intranet:
+    driver: bridge
+
+volumes:
+  letsencrypt:
+  kratos-sqlite:
+  hydra-sqlite:
+  certs:
+  vhost:
+  html:
+  acme:

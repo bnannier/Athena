@@ -1,0 +1,14 @@
+services:
+  # Production Admin UI Service
+  kratos-admin-ui:
+    image: dhiagharsallaoui/kratos-admin-ui:latest
+    ports:
+      - '3000:3000'
+    environment:
+      - NODE_ENV=production
+      - KRATOS_ADMIN_URL=http://kratos:4434
+      - KRATOS_PUBLIC_URL=http://kratos:4433
+    networks:
+      - intranet
+    depends_on:
+      - kratos

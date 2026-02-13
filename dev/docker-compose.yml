@@ -1,0 +1,174 @@
+version: '3.8'
+
+services:
+  # Kratos Migration Service
+  kratos-migrate:
+    image: oryd/kratos:v25.4.0
+    environment:
+      - DSN=sqlite:///var/lib/sqlite/db.sqlite?_fk=true&mode=rwc
+    volumes:
+      - type: volume
+        source: kratos-sqlite
+        target: /var/lib/sqlite
+        read_only: false
+      - type: bind
+        source: ./kratos
+        target: /etc/config/kratos
+    command: -c /etc/config/kratos/kratos.yml migrate sql -e --yes
+    restart: on-failure
+    networks:
+      - intranet
+
+  # Kratos Main Service
+  kratos:
+    depends_on:
+      - kratos-migrate
+    image: oryd/kratos:v25.4.0
+    ports:
+      - '4433:4433' # public
+      - '4434:4434' # admin
+    restart: unless-stopped
+    environment:
+      - DSN=sqlite:///var/lib/sqlite/db.sqlite?_fk=true
+      - LOG_LEVEL=trace
+    command: serve -c /etc/config/kratos/kratos.yml --dev --watch-courier
+    volumes:
+      - type: volume
+        source: kratos-sqlite
+        target: /var/lib/sqlite
+        read_only: false
+      - type: bind
+        source: ./kratos
+        target: /etc/config/kratos
+    networks:
+      - intranet
+
+  # Kratos Self-Service UI
+  kratos-selfservice-ui:
+    image: oryd/kratos-selfservice-ui-node:v25.4.0
+    ports:
+      - '4455:4455'
+    environment:
+      - PORT=4455
+      - KRATOS_PUBLIC_URL=http://kratos:4433/
+      - KRATOS_BROWSER_URL=http://127.0.0.1:4433/
+      - COOKIE_SECRET=changeme
+      - CSRF_COOKIE_NAME=ory_csrf_ui
+      - CSRF_COOKIE_SECRET=changeme
+      - SECURITY_MODE=
+    networks:
+      - intranet
+    restart: on-failure
+    depends_on:
+      - kratos
+
+  # Mail Service for Testing
+  mailslurper:
+    image: oryd/mailslurper:latest-smtps
+    ports:
+      - '4436:4436'
+      - '4437:4437'
+    networks:
+      - intranet
+
+  # Initialize test identities
+  init-identities:
+    image: curlimages/curl:latest
+    depends_on:
+      - kratos
+    volumes:
+      - type: bind
+        source: ./init-identities.sh
+        target: /init-identities.sh
+    networks:
+      - intranet
+    command: sh /init-identities.sh
+    restart: 'no'
+    profiles:
+      - init
+
+  # Initialize OAuth 2.0 clients
+  init-clients:
+    image: curlimages/curl:latest
+    depends_on:
+      - hydra
+    volumes:
+      - type: bind
+        source: ./init-clients.sh
+        target: /init-clients.sh
+    networks:
+      - intranet
+    command: sh /init-clients.sh
+    restart: 'no'
+    profiles:
+      - init
+
+  # Hydra SQLite Volume Permissions
+  hydra-sqlite-init:
+    image: busybox
+    volumes:
+      - hydra-sqlite:/mnt/sqlite
+    command: 'chmod -R 777 /mnt/sqlite'
+
+  # Hydra Migration Service
+  hydra-migrate:
+    image: oryd/hydra:v25.4.0
+    environment:
+      - DSN=sqlite:///mnt/sqlite/db.sqlite?_fk=true&mode=rwc
+    command: migrate -c /etc/config/hydra/hydra.yml sql up -e --yes
+    volumes:
+      - type: volume
+        source: hydra-sqlite
+        target: /mnt/sqlite
+        read_only: false
+      - type: bind
+        source: ./hydra
+        target: /etc/config/hydra
+    restart: on-failure
+    networks:
+      - intranet
+    depends_on:
+      - hydra-sqlite-init
+
+  # Hydra Main Service
+  hydra:
+    image: oryd/hydra:v25.4.0
+    ports:
+      - '4444:4444' # Public port
+      - '4445:4445' # Admin port
+      - '5555:5555' # Port for hydra token user
+    command: serve -c /etc/config/hydra/hydra.yml all --dev
+    volumes:
+      - type: volume
+        source: hydra-sqlite
+        target: /mnt/sqlite
+        read_only: false
+      - type: bind
+        source: ./hydra
+        target: /etc/config/hydra
+    environment:
+      - DSN=sqlite:///mnt/sqlite/db.sqlite?_fk=true&mode=rwc
+    restart: unless-stopped
+    depends_on:
+      - hydra-migrate
+      - hydra-sqlite-init
+    networks:
+      - intranet
+
+  # Hydra Consent/Login UI
+  hydra-consent:
+    environment:
+      - HYDRA_ADMIN_URL=http://hydra:4445
+    image: oryd/hydra-login-consent-node:v25.4.0
+    ports:
+      - '3001:3000'
+    restart: unless-stopped
+    networks:
+      - intranet
+
+networks:
+  intranet:
+
+volumes:
+  kratos-sqlite:
+  hydra-sqlite:
